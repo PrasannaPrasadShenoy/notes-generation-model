@@ -1,11 +1,11 @@
 """
-ILA Notes Generation Model - Training Script
-Fine-tunes a BART model on educational summarization dataset to generate enhanced notes
+Train ILA Notes Generation Model on Custom YouTube Transcript Data
+Fine-tunes the model on your own transcript data instead of the default dataset
 """
 
 import os
 import torch
-from datasets import load_dataset
+from datasets import load_from_disk, DatasetDict
 from transformers import (
     AutoTokenizer,
     AutoModelForSeq2SeqLM,
@@ -13,13 +13,11 @@ from transformers import (
     TrainingArguments,
     DataCollatorForSeq2Seq
 )
-from tqdm import tqdm
 import json
 from config import (
-    MODEL_NAME, DATASET_NAME, OUTPUT_DIR, TRAIN_SAMPLES, VAL_SAMPLES,
-    MAX_INPUT_LENGTH, MAX_TARGET_LENGTH, NUM_EPOCHS, LEARNING_RATE,
-    TRAIN_BATCH_SIZE, EVAL_BATCH_SIZE, GRADIENT_ACCUMULATION_STEPS,
-    WARMUP_STEPS, WEIGHT_DECAY, USE_GPU, FP16
+    MODEL_NAME, OUTPUT_DIR, MAX_INPUT_LENGTH, MAX_TARGET_LENGTH,
+    NUM_EPOCHS, LEARNING_RATE, TRAIN_BATCH_SIZE, EVAL_BATCH_SIZE,
+    GRADIENT_ACCUMULATION_STEPS, WARMUP_STEPS, WEIGHT_DECAY, USE_GPU, FP16
 )
 
 def check_gpu():
@@ -33,26 +31,23 @@ def check_gpu():
         print("⚠️  No GPU detected. Training will use CPU (slower).")
         return False
 
-def load_and_prepare_dataset():
-    """Load and prepare the dataset"""
-    print("\n📚 Loading dataset...")
-    print(f"   Dataset: {DATASET_NAME}")
+def load_custom_dataset(dataset_path: str):
+    """Load custom dataset from disk"""
+    print(f"\n📚 Loading custom dataset from {dataset_path}...")
     
     try:
-        dataset = load_dataset(DATASET_NAME)
+        dataset = load_from_disk(dataset_path)
         print(f"✅ Dataset loaded successfully!")
-        print(f"   Train size: {len(dataset['train'])}")
-        print(f"   Validation size: {len(dataset['validation'])}")
         
-        # Select subset for faster training
-        train_data = dataset["train"].select(range(min(TRAIN_SAMPLES, len(dataset["train"]))))
-        val_data = dataset["validation"].select(range(min(VAL_SAMPLES, len(dataset["validation"]))))
+        if isinstance(dataset, DatasetDict):
+            print(f"   Train size: {len(dataset['train'])}")
+            print(f"   Validation size: {len(dataset.get('validation', []))}")
+            if 'test' in dataset:
+                print(f"   Test size: {len(dataset['test'])}")
+        else:
+            print(f"   Dataset size: {len(dataset)}")
         
-        print(f"\n📊 Using subset:")
-        print(f"   Train samples: {len(train_data)}")
-        print(f"   Validation samples: {len(val_data)}")
-        
-        return train_data, val_data
+        return dataset
     except Exception as e:
         print(f"❌ Error loading dataset: {e}")
         raise
@@ -91,15 +86,57 @@ def preprocess_function(examples, tokenizer):
 
 def main():
     """Main training function"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Train notes generation model on custom data')
+    parser.add_argument('--dataset', type=str, required=True,
+                       help='Path to custom dataset (from prepare_training_data.py)')
+    parser.add_argument('--output', type=str, default=None,
+                       help='Output directory for trained model (default: ./ila-notes-generator-custom)')
+    parser.add_argument('--epochs', type=int, default=None,
+                       help='Number of training epochs (overrides config)')
+    parser.add_argument('--learning-rate', type=float, default=None,
+                       help='Learning rate (overrides config)')
+    parser.add_argument('--batch-size', type=int, default=None,
+                       help='Batch size (overrides config)')
+    
+    args = parser.parse_args()
+    
     print("=" * 60)
-    print("🧠 ILA Notes Generation Model - Training")
+    print("🧠 ILA Notes Generation Model - Custom Training")
     print("=" * 60)
     
     # Check GPU
     use_gpu = check_gpu()
     
-    # Load dataset
-    train_data, val_data = load_and_prepare_dataset()
+    # Set output directory
+    output_dir = args.output or "./ila-notes-generator-custom"
+    
+    # Load custom dataset
+    dataset = load_custom_dataset(args.dataset)
+    
+    # Handle DatasetDict vs single Dataset
+    if isinstance(dataset, DatasetDict):
+        train_data = dataset['train']
+        val_data = dataset.get('validation', dataset.get('val', None))
+        if val_data is None and 'test' in dataset:
+            # Use test set as validation if no validation set
+            val_data = dataset['test']
+    else:
+        # Single dataset - split it
+        split = dataset.train_test_split(test_size=0.2)
+        train_data = split['train']
+        val_data = split['test']
+    
+    if val_data is None:
+        print("⚠️  No validation set found. Using 20% of training data for validation.")
+        split = train_data.train_test_split(test_size=0.2)
+        train_data = split['train']
+        val_data = split['test']
+    
+    print(f"\n📊 Training configuration:")
+    print(f"   Train samples: {len(train_data)}")
+    print(f"   Validation samples: {len(val_data)}")
     
     # Load model and tokenizer
     print(f"\n🤖 Loading model: {MODEL_NAME}")
@@ -140,18 +177,22 @@ def main():
         padding=True
     )
     
-    # Training arguments
+    # Training arguments (use command line args if provided)
+    num_epochs = args.epochs or NUM_EPOCHS
+    learning_rate = args.learning_rate or LEARNING_RATE
+    batch_size = args.batch_size or TRAIN_BATCH_SIZE
+    
     training_args = TrainingArguments(
-        output_dir=OUTPUT_DIR,
+        output_dir=output_dir,
         overwrite_output_dir=True,
-        num_train_epochs=NUM_EPOCHS,
-        per_device_train_batch_size=TRAIN_BATCH_SIZE if use_gpu else 1,
+        num_train_epochs=num_epochs,
+        per_device_train_batch_size=batch_size if use_gpu else 1,
         per_device_eval_batch_size=EVAL_BATCH_SIZE if use_gpu else 1,
         gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
-        learning_rate=LEARNING_RATE,
+        learning_rate=learning_rate,
         warmup_steps=WARMUP_STEPS,
         weight_decay=WEIGHT_DECAY,
-        logging_dir=f"{OUTPUT_DIR}/logs",
+        logging_dir=f"{output_dir}/logs",
         logging_steps=50,
         eval_strategy="epoch",  # Changed from evaluation_strategy in newer transformers
         save_strategy="epoch",
@@ -159,9 +200,9 @@ def main():
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
-        fp16=FP16 and use_gpu,  # Use mixed precision if GPU available
+        fp16=FP16 and use_gpu,
         dataloader_num_workers=2 if use_gpu else 0,
-        report_to="none",  # Disable wandb/tensorboard
+        report_to="none",
         push_to_hub=False,
     )
     
@@ -177,43 +218,45 @@ def main():
     
     # Train
     print("\n🚀 Starting training...")
-    print(f"   Output directory: {OUTPUT_DIR}")
-    print(f"   Epochs: {training_args.num_train_epochs}")
-    print(f"   Learning rate: {training_args.learning_rate}")
-    print(f"   Batch size: {training_args.per_device_train_batch_size}")
-    print(f"   Gradient accumulation: {training_args.gradient_accumulation_steps}")
-    print(f"   Effective batch size: {training_args.per_device_train_batch_size * training_args.gradient_accumulation_steps}")
+    print(f"   Output directory: {output_dir}")
+    print(f"   Epochs: {num_epochs}")
+    print(f"   Learning rate: {learning_rate}")
+    print(f"   Batch size: {batch_size}")
+    print(f"   Gradient accumulation: {GRADIENT_ACCUMULATION_STEPS}")
+    print(f"   Effective batch size: {batch_size * GRADIENT_ACCUMULATION_STEPS}")
     
     train_result = trainer.train()
     
     # Save model
     print("\n💾 Saving model...")
-    trainer.save_model(OUTPUT_DIR)
-    tokenizer.save_pretrained(OUTPUT_DIR)
+    trainer.save_model(output_dir)
+    tokenizer.save_pretrained(output_dir)
     
     # Save training info
     training_info = {
         "model_name": MODEL_NAME,
-        "dataset": DATASET_NAME,
+        "dataset": args.dataset,
         "train_samples": len(train_data),
         "val_samples": len(val_data),
         "max_input_length": MAX_INPUT_LENGTH,
         "max_target_length": MAX_TARGET_LENGTH,
         "training_loss": train_result.training_loss,
-        "epochs": training_args.num_train_epochs,
-        "learning_rate": training_args.learning_rate,
+        "epochs": num_epochs,
+        "learning_rate": learning_rate,
+        "batch_size": batch_size,
+        "custom_training": True
     }
     
-    with open(f"{OUTPUT_DIR}/training_info.json", "w") as f:
+    with open(f"{output_dir}/training_info.json", "w") as f:
         json.dump(training_info, f, indent=2)
     
     print(f"\n✅ Training complete!")
-    print(f"   Model saved to: {OUTPUT_DIR}")
+    print(f"   Model saved to: {output_dir}")
     print(f"   Training loss: {train_result.training_loss:.4f}")
     
     # Test inference
     print("\n🧪 Testing model with sample input...")
-    sample_text = train_data[0]["article"][:500]  # First 500 chars
+    sample_text = train_data[0]["article"][:500] if len(train_data) > 0 else "Sample text for testing..."
     inputs = tokenizer(sample_text, return_tensors="pt", truncation=True, max_length=MAX_INPUT_LENGTH)
     
     if use_gpu:
@@ -236,7 +279,8 @@ def main():
     print(generated_notes)
     print("-" * 60)
     
-    print("\n🎉 All done! You can now use inference.py to generate notes.")
+    print("\n🎉 All done! You can now use this model in inference.py")
+    print(f"   Update MODEL_DIR in config.py to: {output_dir}")
 
 if __name__ == "__main__":
     main()

@@ -5,6 +5,7 @@ Configuration file for ILA Notes Generation Model
 # Model Configuration
 MODEL_NAME = "facebook/bart-large-cnn"
 MODEL_DIR = "./ila-notes-generator"
+OUTPUT_DIR = "./ila-notes-generator"  # Output directory for trained model
 
 # Dataset Configuration
 DATASET_NAME = "ccdv/arxiv-summarization"
@@ -45,4 +46,10 @@ DETAILED_NOTES_LENGTH_PENALTY = 2.5
 # Device Configuration
 USE_GPU = True  # Will auto-detect if available
 FP16 = True  # Mixed precision training (if GPU available)
+
+# Gemini API Configuration
+USE_GEMINI_API = False  # Set to True to use Gemini API
+GEMINI_API_KEY = None  # Set via environment variable or .env file
+GEMINI_MODEL = "gemini-1.5-pro"  # or "gemini-pro"
+TOP_K_RETRIEVAL = 6  # Number of context chunks to retrieve
 

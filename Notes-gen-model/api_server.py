@@ -6,10 +6,21 @@ Provides HTTP endpoints for easy integration with ILA backend
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from inference import NotesGenerator, generate_notes
+from enhanced_notes import EnhancedNotesGenerator
 from utils import validate_transcript, estimate_reading_time, extract_key_phrases
 import os
+import sys
 import logging
 from datetime import datetime
+
+# Add src to path for RAG imports
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+try:
+    from src.rag_inference import RAGInference
+    RAG_AVAILABLE = True
+except ImportError:
+    RAG_AVAILABLE = False
+    print("⚠️  RAG modules not available. Install dependencies: pip install sentence-transformers faiss-cpu")
 
 # Configure logging
 logging.basicConfig(
@@ -21,16 +32,41 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 CORS(app)  # Enable CORS for frontend integration
 
-# Global model instance (loaded once at startup)
+# Global model instances (loaded once at startup)
 generator = None
+enhanced_generator = None
+rag_inference = None
 
 def init_model():
     """Initialize the model on server startup"""
-    global generator
+    global generator, enhanced_generator, rag_inference
     try:
         logger.info("Loading notes generation model...")
         generator = NotesGenerator()
+        enhanced_generator = EnhancedNotesGenerator()
         logger.info("✅ Model loaded successfully!")
+        
+        # Try to initialize RAG (optional)
+        if RAG_AVAILABLE:
+            try:
+                model_path = os.getenv("MODEL_PATH", "./ila-notes-generator")
+                index_path = os.getenv("INDEX_PATH", "./knowledge_index")
+                
+                if os.path.exists(model_path) and os.path.exists(f"{index_path}.index"):
+                    rag_inference = RAGInference(
+                        model_path=model_path,
+                        index_path=index_path,
+                        use_gemini=None  # Auto-detect
+                    )
+                    if rag_inference.use_gemini and rag_inference.gemini_client:
+                        logger.info(f"✅ Hybrid RAG loaded: Gemini API + Local Retrieval")
+                    elif rag_inference.model:
+                        logger.info("✅ RAG loaded: Local Model + Local Retrieval")
+                else:
+                    logger.info("ℹ️  RAG not initialized (model or index not found)")
+            except Exception as e:
+                logger.warning(f"Could not initialize RAG: {e}")
+        
         return True
     except Exception as e:
         logger.error(f"❌ Failed to load model: {e}")
@@ -91,6 +127,9 @@ def generate_notes_endpoint():
                 'error': error
             }), 400
         
+        # Initialize metadata
+        metadata = {}
+        
         # Generate notes based on type
         if note_type == 'short':
             notes = generator.generate_short_notes(transcript, format_output=(format_type != 'plain'))
@@ -101,16 +140,28 @@ def generate_notes_endpoint():
                 include_metadata=include_metadata
             )
         elif note_type == 'enhanced':
-            notes = generator.generate_enhanced_notes(transcript)
+            # Use enhanced generator for v2 features
+            enhanced_result = enhanced_generator.generate_enhanced_notes_v2(transcript)
+            notes = enhanced_result['notes']
+            # Include additional metadata from enhanced generator
+            if include_metadata:
+                metadata = {
+                    'key_concepts': enhanced_result['enhancements'].get('key_concepts', []),
+                    'study_tips': enhanced_result['enhancements'].get('study_tips', []),
+                    'related_topics': enhanced_result['enhancements'].get('related_topics', []),
+                    'learning_objectives': enhanced_result['enhancements'].get('learning_objectives', []),
+                    'reading_time_minutes': enhanced_result['metadata']['reading_time_minutes'],
+                    'word_count': enhanced_result['metadata']['word_count'],
+                    'key_topics': enhanced_result['metadata']['key_topics']
+                }
         else:
             return jsonify({
                 'success': False,
                 'error': f'Invalid note type: {note_type}. Must be "short", "detailed", or "enhanced"'
             }), 400
         
-        # Extract metadata
-        metadata = {}
-        if include_metadata:
+        # Extract metadata if not already set (for short/detailed notes)
+        if include_metadata and not metadata:
             reading_time = estimate_reading_time(notes)
             key_topics = extract_key_phrases(transcript, max_phrases=10)
             metadata = {
@@ -219,6 +270,114 @@ def generate_notes_batch():
         
     except Exception as e:
         logger.error(f"Error in batch processing: {e}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/generate-enhanced-v2', methods=['POST'])
+def generate_enhanced_v2():
+    """
+    Generate enhanced notes v2 with all features (key concepts, study tips, etc.)
+    
+    Request body:
+    {
+        "transcript": "Your transcript text here...",
+        "include_concepts": true,
+        "include_tips": true,
+        "include_topics": true,
+        "include_objectives": true
+    }
+    """
+    try:
+        data = request.get_json()
+        transcript = data.get('transcript', '').strip()
+        
+        is_valid, error = validate_transcript(transcript)
+        if not is_valid:
+            return jsonify({
+                'success': False,
+                'error': error
+            }), 400
+        
+        # Generate enhanced notes v2
+        result = enhanced_generator.generate_enhanced_notes_v2(
+            transcript,
+            include_concepts=data.get('include_concepts', True),
+            include_tips=data.get('include_tips', True),
+            include_topics=data.get('include_topics', True),
+            include_objectives=data.get('include_objectives', True)
+        )
+        
+        return jsonify({
+            'success': True,
+            'notes': result['notes'],
+            'base_notes': result['base_notes'],
+            'enhancements': result['enhancements'],
+            'metadata': result['metadata']
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Error generating enhanced notes v2: {e}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/generate-hybrid-rag', methods=['POST'])
+def generate_hybrid_rag():
+    """
+    Generate notes using Hybrid RAG (Local Retrieval + Gemini/Local Generation)
+    
+    Request body:
+    {
+        "transcript": "Your transcript text here...",
+        "query": "Explain this topic",
+        "top_k": 6,
+        "force_local": false,
+        "force_gemini": false
+    }
+    """
+    if not RAG_AVAILABLE or not rag_inference:
+        return jsonify({
+            'success': False,
+            'error': 'RAG system not available. Make sure model and index are set up. See RAG_SETUP_GUIDE.md'
+        }), 503
+    
+    try:
+        data = request.get_json()
+        transcript = data.get('transcript', '').strip()
+        query = data.get('query')
+        top_k = data.get('top_k')
+        force_local = data.get('force_local', False)
+        force_gemini = data.get('force_gemini', False)
+        
+        is_valid, error = validate_transcript(transcript)
+        if not is_valid:
+            return jsonify({
+                'success': False,
+                'error': error
+            }), 400
+        
+        # Generate with hybrid RAG
+        notes = rag_inference.generate_notes(
+            transcript=transcript,
+            query=query,
+            top_k=top_k,
+            force_local=force_local,
+            force_gemini=force_gemini
+        )
+        
+        return jsonify({
+            'success': True,
+            'notes': notes,
+            'generation_method': notes.get('generation_method', 'unknown'),
+            'used_gemini': notes.get('generation_method') == 'gemini',
+            'retrieval_count': notes.get('retrieval_count', 0)
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Error in hybrid RAG generation: {e}", exc_info=True)
         return jsonify({
             'success': False,
             'error': str(e)
